@@ -3,6 +3,10 @@
 #include <string.h>
 #include <stdint.h>
 #include <errno.h>
+#include <sys/ioctl.h>
+#include <net/if.h> 
+#include <unistd.h>
+#include <netinet/in.h>
 #include <inttypes.h>
 #include <evhtp/evhtp.h>
 #include <event2/util.h>
@@ -12,11 +16,16 @@
 #include <sys/stat.h>
 #include <signal.h>
 #include <math.h>
+#include <thread.h>
+#include <float.h>
+
 #include "daap-client.h"
 
 #define TICK 1000000
 #define CLT_COUNT 6
 #define TEST_STR "/databases/1/items/%d"
+#define MAX_RETRY 10
+#define TWOPI 2*3.14159265358979323846
 
 #define TIMESTAMP(t) \
     (1000000 * t.tv_sec + t.tv_usec)
@@ -30,6 +39,7 @@ static uint64_t bytes_since_tick = 0;
 
 static uint64_t      updates_since_tick = 0;
 static uint64_t      accumulated_active = 0;
+static uint64_t      accumulated_latency = 0;
 static uint64_t      currently_active = 0;
 // static pthread_mutex_t   currently_active_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t main_pid, signal_pid, timer_pid, *pids;
@@ -37,6 +47,46 @@ static pthread_t main_pid, signal_pid, timer_pid, *pids;
 
 static char localhost[256];
 static app_t    *apps;
+
+static uint64_t mac_address() {
+    // taken from https://stackoverflow.com/a/1779758
+    // retrieve the mac address of the first non-loopback inet interface
+    struct ifreq ifr;
+    struct ifconf ifc;
+    char buf[1024];
+    int success = 0;
+
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (sock == -1) { goto error; };
+
+    ifc.ifc_len = sizeof(buf);
+    ifc.ifc_buf = buf;
+    if (ioctl(sock, SIOCGIFCONF, &ifc) == -1) { /* handle error */ }
+
+    struct ifreq* it = ifc.ifc_req;
+    const struct ifreq* const end = it + (ifc.ifc_len / sizeof(struct ifreq));
+
+    for (; it != end; ++it) {
+        strcpy(ifr.ifr_name, it->ifr_name);
+        if (ioctl(sock, SIOCGIFFLAGS, &ifr) == 0) {
+            if (! (ifr.ifr_flags & IFF_LOOPBACK)) { // don't count loopback
+                if (ioctl(sock, SIOCGIFHWADDR, &ifr) == 0) {
+                    success = 1;
+                    break;
+                }
+            }
+        }
+        else { goto error; }
+    }
+
+    unsigned char mac_address[8] = {0};
+
+    if (success) memcpy(mac_address, ifr.ifr_hwaddr.sa_data, 6);
+    uint64_t *x = (uint64_t *)mac_address;
+    return *x;
+error:
+    return 0;
+}
 
 static void print_test(test_t *t) {
     fprintf(stderr, ("\t\tthread     %d\n"
@@ -47,8 +97,8 @@ static void print_test(test_t *t) {
                      "\t\tsize       %lu\n"
                      "\t\ttimer      %p\n"
                      "\t\tbase       %p\n"
-                     "\t\treq        %p\n"
-                     "\t\tconn       %p\n"), 
+                     "\t\tconn       %p\n"
+                     "\t\treq        %p\n"), 
             t->thread_id, 
             t->connection_id,
             t->request_id,
@@ -57,14 +107,16 @@ static void print_test(test_t *t) {
             t->size,
             t->timer,
             t->base,
-            t->req,
-            t->conn
+            t->conn,
+            t->conn ? t->conn->request : NULL
            );
 }
 
 
 int rand_lim(int limit) {
-/* return a random number in the range [0..limit)
+/* return a uniform random integer in the range [0..limit)
+ * just using mod operator can bias the output so its not
+ * truly uniform ... this method does not
  */
 
     int divisor = RAND_MAX/limit;
@@ -76,6 +128,7 @@ int rand_lim(int limit) {
 
     return retval;
 }
+
 double rand_uniform() {
     // generates uniform random on interval [0, 1)
     return (double)rand() / ((double)RAND_MAX + 1);
@@ -87,13 +140,28 @@ double rand_exponential(double lambda) {
     return -log(u)/lambda;
 }
 
-double rand_normal() {
-    // use central-limit theorem to approximate gaussian distribution
-    // mean = CLT_COUNT/2
-    double result = 0;
-    for (int i = 0; i < CLT_COUNT; i++) 
-        result += rand_uniform(); 
-    return result;   
+double rand_normal(double mean, double std) {
+
+    // BOX-MUELLER transformation to generate two gaussian from two uniform
+    // since we only need one at a time, save the other one generated
+    _Thread_local static double z1 = 0;
+    _Thread_local static int generate = 0;
+    
+    generate = !generate;
+    if (!generate) 
+        return z1 * std + mean;
+    
+    double u1, u2;
+    do {
+        u1 = rand_uniform();
+        u2 = rand_uniform();
+    } while (u1 <= DBL_EPSILON);
+    
+    double z0;
+    z0 = sqrt(-2.0 * log(u1)) * cos (TWOPI * u2);
+    z1 = sqrt(-2.0 * log(u1)) * sin (TWOPI * u2);
+    
+    return z0 * std + mean;
 }
 
 void schedule_request(test_t *t, int ms) { 
@@ -123,7 +191,7 @@ static evhtp_res request_done_cb(evhtp_request_t * req,  void *arg) {
         long thinktime = (long)(1000 * rand_exponential(2));
         schedule_request(t, thinktime);
     }
-    return EVHTP_RES_CONTINUE;
+    return EVHTP_RES_OK;
 }
 
 static void request_cb(evhtp_request_t *req, void *arg) {
@@ -131,7 +199,13 @@ static void request_cb(evhtp_request_t *req, void *arg) {
     //test_t *t = (test_t *)arg;
     //evhtp_request_free(req);
     //t->req = NULL;
+    evhtp_unset_all_hooks(&req->hooks);
+    if (req->uri) {
+        free(req->uri);
     }
+    req->uri = NULL;
+    evhtp_request_free(req);
+}
 
 static evhtp_res recv_chunk_cb(evhtp_request_t * req, evbuf_t * buf, void * arg) {
 
@@ -142,22 +216,36 @@ static evhtp_res recv_chunk_cb(evhtp_request_t * req, evbuf_t * buf, void * arg)
         GLOBAL_ADD(updates_since_tick, 1);
         GLOBAL_ADD(accumulated_active, currently_active);
         
-
+        t->retries = 0;
+        t->delay = 1;
         t->started = 1;
-        gettimeofday(&(t->responded), NULL); 
+        gettimeofday(&(t->responded), NULL);
+        uint64_t latency = TIMESTAMP(t->responded) - TIMESTAMP(t->start);
+
+        GLOBAL_ADD(accumulated_latency, latency);
     }
     
     GLOBAL_ADD(bytes_since_tick, evbuffer_get_length(buf));
 
+    //return EVHTP_RES_CONTINUE;
     return EVHTP_RES_OK;
 }
 
-static evhtp_res conn_error_cb(evhtp_request_t * req, void * arg) {
-    //fprintf(stderr, "conn_error_cb()\n");
+//static evhtp_res conn_error_cb(evhtp_request_t * req, void * arg) {
+static evhtp_res conn_error_cb(evhtp_connection_t * con, void * arg) {
+
+    // retry a finite times, backing off each time
     test_t *t = (test_t *)arg;
-    t->conn = evhtp_connection_new(t->base, conf.host, conf.port);
-    evhtp_connection_set_hook(t->conn, evhtp_hook_on_connection_fini, conn_error_cb, t);
-    schedule_request(t, 0);
+    //print_test(t);
+    evhtp_unset_all_hooks(&con->hooks);
+    t->conn = NULL;
+    if (t->retries <= MAX_RETRY) {
+        t->retries++;
+        t->delay *= 2;
+        schedule_request(t, 1);
+    } else {
+        conf.active = 0;
+    }
 
 }
 
@@ -166,9 +254,11 @@ void *timer_thread(void *arg) {
     uint64_t acc, elapsed;
     uint64_t tick_active;
     uint64_t tick_updates;
+    uint64_t tick_latency;
+
     gettimeofday(&end, NULL);
-    double rate;
-    while (1) {
+    double rate, latency;
+    while (conf.active) {
         pthread_testcancel();
         usleep(TICK);
         prev = end;
@@ -177,34 +267,21 @@ void *timer_thread(void *arg) {
         
         acc = __sync_fetch_and_and(&bytes_since_tick, 0);
 
-        /*
-        pthread_mutex_lock(&bytes_since_tick_mutex);
-        acc = bytes_since_tick;
-        bytes_since_tick = 0;
-        pthread_mutex_unlock(&bytes_since_tick_mutex);
-        */
-
-
         tick_active  = __sync_fetch_and_and(&accumulated_active, 0);
         tick_updates = __sync_fetch_and_and(&updates_since_tick, 0);
-
-        /*
-        pthread_mutex_lock(&currently_active_mutex);
-        tick_active        = accumulated_active;
-        tick_updates       = updates_since_tick;
-        accumulated_active = 0;
-        updates_since_tick = 0;
-        pthread_mutex_unlock(&currently_active_mutex);
-        */
+        tick_latency = __sync_fetch_and_and(&accumulated_latency, 0);
 
         rate = (double)acc * 1000000 / (elapsed * 1024 * 1024);
+        if (tick_updates > 0)
+            latency = (double)tick_latency / (1000*tick_updates);
+        else latency = 0;
         
         double avg_active;
         if (tick_updates) 
             avg_active = (double)tick_active / tick_updates;
         else avg_active = 0;
 
-        fprintf(stderr, "TICK: %luus elapsed, %lu packets, %lu bytes, %.2f MB/s\n", elapsed,  tick_active, acc, rate);
+        fprintf(stderr, "TICK: %8luus elapsed %8lu chunks %8lu songs %12lu bytes \tAVG: %8.2f MB/s %10.2fms latency\n", elapsed,  tick_active, tick_updates, acc, rate, latency);
 
     }
     fprintf(stderr, "   broke out of timer thread\n");
@@ -212,28 +289,36 @@ void *timer_thread(void *arg) {
 
 static void request_item(evutil_socket_t fd, short events, void *arg) {
     test_t *t      = (test_t *)arg;
-    t->song_id     = 700*rand_normal();
+    t->song_id     = (int)rand_normal(2000, 500);
     t->request_id += 1;
     t->started     = 0;
     t->size        = 0;
-    t->req         = evhtp_request_new(request_cb, t);
+    evhtp_request_t *req;
+
+    if (!t->conn) {
+        t->conn = evhtp_connection_new(t->base, conf.host, conf.port);
+        evhtp_connection_set_hook(t->conn, evhtp_hook_on_connection_fini, conn_error_cb, t);
+    }
+    
+    req         = evhtp_request_new(request_cb, t);
+    
 
 //    fprintf(stderr, "    +thread %d connection %d request_item(%d)\n", t->thread_id, t->connection_id, t->song_id);
     char str_buf[256];
     snprintf(str_buf, 255, TEST_STR, t->song_id);
 
-    evhtp_headers_add_header(t->req->headers_out,
+    evhtp_headers_add_header(req->headers_out,
                              evhtp_header_new("Host", localhost, 0, 0));
-    evhtp_headers_add_header(t->req->headers_out,
+    evhtp_headers_add_header(req->headers_out,
                              evhtp_header_new("User-Agent", "daap-client", 0, 0));
-    evhtp_headers_add_header(t->req->headers_out,
-                             evhtp_header_new("Connection", "keep-alive", 0, 0));
-    evhtp_headers_add_header(t->req->headers_out,
+    evhtp_headers_add_header(req->headers_out,
                              evhtp_header_new("Timeout", "1800", 0, 0));
 
-    evhtp_request_set_hook(t->req, evhtp_hook_on_read, recv_chunk_cb, t);
-    evhtp_request_set_hook(t->req, evhtp_hook_on_chunks_complete, request_done_cb, t);
-    evhtp_make_request(t->conn, t->req, htp_method_GET, str_buf);
+    evhtp_request_set_hook(req, evhtp_hook_on_read, recv_chunk_cb, t);
+    evhtp_request_set_hook(req, evhtp_hook_on_chunks_complete, request_done_cb, t);
+    req->flags |= EVHTP_REQ_FLAG_KEEPALIVE;
+    gettimeofday(&(t->start), NULL);
+    evhtp_make_request(t->conn, req, htp_method_GET, str_buf);
 }
 
 test_t **test;
@@ -249,37 +334,23 @@ void *request_thread(void *arg) {
     test_t *t = test[app->thread_id] = calloc(app->count, sizeof(test_t));
     evbase_t *evbase = event_base_new();
 
-    //while (conf.active) {
         for (int i = 0; i < app->count; i++) {
-            fprintf(stderr, "thread %d creating connection %d\n", app->thread_id, i);
             t[i].req = NULL;
             t[i].thread_id  = app->thread_id;
             t[i].base = evbase;
             t[i].request_id = 0;
             t[i].connection_id = i;
             t[i].timer = evtimer_new(evbase, request_item, &t[i]);
-            t[i].conn = evhtp_connection_new(evbase, conf.host, conf.port);
-            evhtp_connection_set_hook(t[i].conn, evhtp_hook_on_connection_fini, conn_error_cb, &t[i]);
+            t[i].conn = NULL;
         }
         do {
-            fprintf(stderr, "^thread %d scheduling %d connections...\n", app->thread_id, app->count);
             for (int i = 0; i < app->count; i++) {
                 schedule_request(&t[i], 0);
             }
-            ret = event_base_loop(evbase, 0);
+            ret = event_base_loop(evbase, 0); // ret = 1 if no more scheduled events in loop
             fprintf(stderr, "    !thread %d broke out of loop(%d)\n", app->thread_id, ret);
-        } while (ret == 1);
-        fprintf(stderr, "    *thread %d retrying ...\n", app->thread_id);
-    //}
+        } while (conf.active && ret == 1);
     
-    /*
-    for (int i = 0; i < app->count; i++) {
-        evhtp_connection_free(test[i].conn);
-        event_free(test[i].timer);
-    }
-    event_base_free(evbase);
-    free(test);
-    */
     fprintf(stderr, "   broke out of request thread\n");
     return NULL;
 }
@@ -313,11 +384,6 @@ static void signal_cleanup(void *arg) {
     for (int i = 0; i < conf.threads; i++)
         pthread_join(pids[i], NULL);
     pthread_join(main_pid, NULL);
-    //pthread_join(scanner_pid, NULL);
-    // cancel writer last, others may want to 
-    // write final messages to db
-    //pthread_cancel(writer_pid);
-    //pthread_join(writer_pid, NULL);
 
     exit(EXIT_SUCCESS);
 }
@@ -326,7 +392,6 @@ static void signal_cleanup(void *arg) {
 static void *signal_thread(void *arg) {
     int cleanup_pop_val;
     signal_pid = pthread_self();
-    pthread_detach(signal_pid);
     pthread_cleanup_push(signal_cleanup, NULL);
     struct sigaction act = {0};
     act.sa_handler = handle_signal;
@@ -335,7 +400,7 @@ static void *signal_thread(void *arg) {
     sigset_t mask;
     sigemptyset(&mask);
     int sig;
-    while(1) {
+    while(conf.active) {
         sigsuspend(&mask);
     }
     pthread_cleanup_pop(cleanup_pop_val);
@@ -382,6 +447,12 @@ int main(int argc, char ** argv) {
     conf.limit = 3000;
     conf.threads = 1;
     conf.count = 4;
+	conf.mac   = mac_address();
+
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    uint64_t seed = conf.mac + TIMESTAMP(now);
+    srand((unsigned)seed);
     while(1) {
         int option_index = 0;
         int c = getopt_long(argc, argv, option_string, long_options, &option_index);
@@ -425,12 +496,9 @@ int main(int argc, char ** argv) {
             pthread_create((pthread_t *)&pids[i], NULL, request_thread, &apps[i]);
         }
         
-        // start timer thread
-        //event_base_loop(evbase, 0);
         for (int i = 0; i < conf.threads; i++) {
            pthread_join(pids[i], NULL);
         } 
-        pthread_join(timer_pid, NULL);
         free(apps);
         free(pids);
     fprintf(stderr, "main thread terminated\n");

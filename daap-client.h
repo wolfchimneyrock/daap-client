@@ -10,6 +10,7 @@ typedef struct config_t {
     int   count;
     int   limit;
     int   active;
+    uint64_t mac;
 	char *host;
 } config_t;
 
@@ -22,6 +23,8 @@ typedef struct test_t {
     int started;
     size_t size;
     int request_id;
+    size_t retries;
+    size_t delay;
     struct timeval start, responded, end;
     evhtp_connection_t *conn;
     struct event       *timer;
