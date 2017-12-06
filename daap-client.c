@@ -33,6 +33,8 @@
 #define GLOBAL_ADD(g, v) \
 { while (!__sync_bool_compare_and_swap(&(g), g, g + v)); }
 
+#define FORMAT_HR  "TICK #%3d: %8luus elapsed %8lu chunks %8lu songs %12lu bytes \tAVG: %8.2f MB/s %10.2fms latency\n"
+#define FORMAT_CSV "%d,%lu,%lu,%lu,%lu,%.2f,%.2f\n"
 static config_t  conf;
 static uint64_t bytes_since_tick = 0;
 // static pthread_mutex_t   bytes_since_tick_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -255,7 +257,7 @@ void *timer_thread(void *arg) {
     uint64_t tick_active;
     uint64_t tick_updates;
     uint64_t tick_latency;
-
+    int tickno = 0;
     gettimeofday(&end, NULL);
     double rate, latency;
     while (conf.active) {
@@ -280,8 +282,8 @@ void *timer_thread(void *arg) {
         if (tick_updates) 
             avg_active = (double)tick_active / tick_updates;
         else avg_active = 0;
-
-        fprintf(stderr, "TICK: %8luus elapsed %8lu chunks %8lu songs %12lu bytes \tAVG: %8.2f MB/s %10.2fms latency\n", elapsed,  tick_active, tick_updates, acc, rate, latency);
+        
+        fprintf(stderr, conf.csv ? FORMAT_CSV : FORMAT_HR, tickno++, elapsed,  tick_active, tick_updates, acc, rate, latency);
 
     }
     fprintf(stderr, "   broke out of timer thread\n");
@@ -417,8 +419,9 @@ void assign_signal_handler() {
 
 }
 
-static const char option_string[]  = "Vc:l:p:t:T:h:";
+static const char option_string[]  = "vVc:l:p:t:T:h:";
 static struct option long_options[] = {
+    { "csv",                no_argument,       0,       'v' },
     { "verbose",            no_argument,       0,       'V' },
     { "count",              required_argument, 0,       'c' },
     { "limit",              required_argument, 0,       'l' },
@@ -458,6 +461,8 @@ int main(int argc, char ** argv) {
         int c = getopt_long(argc, argv, option_string, long_options, &option_index);
         if (c == -1) break;
         switch(c) {
+            case 'v': conf.csv = 1;
+                      break;
             case 'V': conf.verbose = 1;
                       break;
             case 'c': INTARG(conf.count, "count");

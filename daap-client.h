@@ -6,6 +6,7 @@ typedef struct config_t {
 	int   port;
 	int   threads;
     int   timeout;
+    int   csv;
     int   verbose;
     int   count;
     int   limit;
